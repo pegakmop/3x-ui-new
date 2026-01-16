@@ -139,137 +139,360 @@ install_docker_compose() {
     print_success "Docker Compose installed successfully!"
 }
 
+# Generate random string
+gen_random_string() {
+    local length="$1"
+    local random_string=$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | fold -w "$length" | head -n 1)
+    echo "$random_string"
+}
+
 # Generate random password
 generate_password() {
     local length=${1:-24}
     tr -dc 'A-Za-z0-9!@#$%^&*()_+' < /dev/urandom | head -c "$length"
 }
 
-# Get server IP
+# Get server IPv4
 get_server_ip() {
     local ip
     ip=$(curl -4 -s ifconfig.me 2>/dev/null || curl -4 -s icanhazip.com 2>/dev/null || curl -4 -s ipinfo.io/ip 2>/dev/null)
     echo "$ip"
 }
 
-# Generate self-signed certificate for IP
-generate_self_signed_cert() {
-    local cert_dir="$1"
-    local domain_or_ip="$2"
-    local days="${3:-365}"
-    
-    print_info "Generating self-signed certificate for $domain_or_ip..."
-    
-    mkdir -p "$cert_dir"
-    
-    # Generate private key
-    openssl genrsa -out "$cert_dir/privkey.pem" 2048
-    
-    # Generate certificate
-    openssl req -new -x509 \
-        -key "$cert_dir/privkey.pem" \
-        -out "$cert_dir/fullchain.pem" \
-        -days "$days" \
-        -subj "/CN=$domain_or_ip" \
-        -addext "subjectAltName=IP:$domain_or_ip,DNS:$domain_or_ip"
-    
-    chmod 600 "$cert_dir/privkey.pem"
-    chmod 644 "$cert_dir/fullchain.pem"
-    
-    print_success "Self-signed certificate generated!"
+# Get server IPv6
+get_server_ipv6() {
+    local ip
+    ip=$(curl -6 -s ifconfig.me 2>/dev/null || curl -6 -s icanhazip.com 2>/dev/null || echo "")
+    echo "$ip"
 }
 
-# Install certbot and get Let's Encrypt certificate
-install_letsencrypt_cert() {
+# Validate IPv4 address
+is_ipv4() {
+    local ip="$1"
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Validate IPv6 address
+is_ipv6() {
+    local ip="$1"
+    if [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]] || [[ $ip =~ ^::$ ]] || [[ $ip =~ : ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Validate domain name
+is_domain() {
     local domain="$1"
-    local cert_dir="$2"
-    local email="${3:-admin@$domain}"
+    if [[ $domain =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if port is in use
+is_port_in_use() {
+    local port="$1"
+    if ss -tuln | grep -q ":${port} "; then
+        return 0
+    fi
+    return 1
+}
+
+# Install acme.sh for SSL certificate management
+install_acme() {
+    print_info "Installing acme.sh for SSL certificate management..."
+    cd ~ || return 1
     
-    print_info "Installing Let's Encrypt certificate for $domain..."
+    # Install dependencies
+    apt-get update -y
+    apt-get install -y curl socat cron
     
-    # Install certbot
-    if ! command -v certbot &> /dev/null; then
-        apt-get update -y
-        apt-get install -y certbot
+    curl -s https://get.acme.sh | sh >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        print_error "Failed to install acme.sh"
+        return 1
+    else
+        print_success "acme.sh installed successfully"
     fi
     
-    # Stop any service on port 80
-    docker stop $(docker ps -q) 2>/dev/null || true
+    # Enable cron for auto-renewal
+    systemctl enable cron 2>/dev/null || true
+    systemctl start cron 2>/dev/null || true
     
-    # Get certificate
-    certbot certonly --standalone \
-        --non-interactive \
-        --agree-tos \
-        --email "$email" \
-        -d "$domain" \
-        --preferred-challenges http
-    
-    # Copy certificates
-    mkdir -p "$cert_dir"
-    cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$cert_dir/"
-    cp "/etc/letsencrypt/live/$domain/privkey.pem" "$cert_dir/"
-    
-    chmod 600 "$cert_dir/privkey.pem"
-    chmod 644 "$cert_dir/fullchain.pem"
-    
-    # Setup auto-renewal cron job
-    setup_cert_renewal "$domain" "$cert_dir"
-    
-    print_success "Let's Encrypt certificate installed!"
+    return 0
 }
 
-# Setup certificate auto-renewal
-setup_cert_renewal() {
+# Setup SSL certificate for domain (90 days, auto-renewal)
+setup_ssl_certificate() {
     local domain="$1"
     local cert_dir="$2"
     
-    print_info "Setting up certificate auto-renewal..."
+    print_info "Setting up SSL certificate for domain: $domain"
     
-    # Create renewal script
-    cat > /etc/cron.daily/3xui-cert-renewal << EOF
-#!/bin/bash
-# 3X-UI Certificate Auto-Renewal Script
-
-certbot renew --quiet --post-hook "cp /etc/letsencrypt/live/$domain/fullchain.pem $cert_dir/ && cp /etc/letsencrypt/live/$domain/privkey.pem $cert_dir/ && cd $INSTALL_DIR && docker compose restart 3xui"
-EOF
+    # Check if acme.sh is installed
+    if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
+        install_acme
+        if [ $? -ne 0 ]; then
+            print_warning "Failed to install acme.sh, skipping SSL setup"
+            return 1
+        fi
+    fi
     
-    chmod +x /etc/cron.daily/3xui-cert-renewal
+    # Create certificate directory
+    local acmeCertPath="/root/cert/${domain}"
+    mkdir -p "$acmeCertPath"
+    mkdir -p "$cert_dir"
     
-    print_success "Auto-renewal configured!"
+    # Stop containers to free port 80
+    print_info "Stopping containers temporarily to free port 80..."
+    cd "$INSTALL_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
+    
+    # Issue certificate
+    print_info "Issuing SSL certificate for ${domain}..."
+    print_warning "Note: Port 80 must be open and accessible from the internet"
+    
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+    ~/.acme.sh/acme.sh --issue -d ${domain} --listen-v6 --standalone --httpport 80 --force
+    
+    if [ $? -ne 0 ]; then
+        print_error "Failed to issue certificate for ${domain}"
+        print_warning "Please ensure port 80 is open and domain points to this server"
+        rm -rf ~/.acme.sh/${domain} 2>/dev/null
+        rm -rf "$acmeCertPath" 2>/dev/null
+        return 1
+    fi
+    
+    # Install certificate to acme path
+    ~/.acme.sh/acme.sh --installcert -d ${domain} \
+        --key-file ${acmeCertPath}/privkey.pem \
+        --fullchain-file ${acmeCertPath}/fullchain.pem \
+        --reloadcmd "cp ${acmeCertPath}/privkey.pem ${cert_dir}/ && cp ${acmeCertPath}/fullchain.pem ${cert_dir}/ && cd ${INSTALL_DIR} && docker compose restart 3xui 2>/dev/null || true" >/dev/null 2>&1
+    
+    if [ $? -ne 0 ]; then
+        print_warning "Certificate install command had issues, checking files..."
+    fi
+    
+    # Copy certificates to our cert directory
+    if [[ -f "${acmeCertPath}/fullchain.pem" && -f "${acmeCertPath}/privkey.pem" ]]; then
+        cp "${acmeCertPath}/fullchain.pem" "${cert_dir}/"
+        cp "${acmeCertPath}/privkey.pem" "${cert_dir}/"
+        chmod 600 "${cert_dir}/privkey.pem"
+        chmod 644 "${cert_dir}/fullchain.pem"
+        print_success "SSL certificate installed successfully!"
+    else
+        print_error "Certificate files not found"
+        return 1
+    fi
+    
+    # Enable auto-renew
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
+    
+    print_success "Certificate valid for 90 days with auto-renewal enabled"
+    return 0
 }
 
-# Setup self-signed certificate renewal (for IP)
-setup_self_signed_renewal() {
+# Setup Let's Encrypt IP certificate with shortlived profile (~6 days validity)
+setup_ip_certificate() {
+    local ipv4="$1"
+    local ipv6="${2:-}"
+    local cert_dir="$3"
+
+    print_info "Setting up Let's Encrypt IP certificate (shortlived profile)..."
+    print_warning "Note: IP certificates are valid for ~6 days and will auto-renew."
+
+    # Check for acme.sh
+    if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
+        install_acme
+        if [ $? -ne 0 ]; then
+            print_error "Failed to install acme.sh"
+            return 1
+        fi
+    fi
+
+    # Validate IP address
+    if [[ -z "$ipv4" ]]; then
+        print_error "IPv4 address is required"
+        return 1
+    fi
+
+    if ! is_ipv4 "$ipv4"; then
+        print_error "Invalid IPv4 address: $ipv4"
+        return 1
+    fi
+
+    # Create certificate directories
+    local acmeCertDir="/root/cert/ip"
+    mkdir -p "$acmeCertDir"
+    mkdir -p "$cert_dir"
+
+    # Build domain arguments
+    local domain_args="-d ${ipv4}"
+    if [[ -n "$ipv6" ]] && is_ipv6 "$ipv6"; then
+        domain_args="${domain_args} -d ${ipv6}"
+        print_info "Including IPv6 address: ${ipv6}"
+    fi
+
+    # Stop containers to free port 80
+    print_info "Stopping containers temporarily to free port 80..."
+    cd "$INSTALL_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
+
+    # Choose port for HTTP-01 listener
+    local WebPort=80
+    
+    # Ensure port 80 is available
+    if is_port_in_use 80; then
+        print_warning "Port 80 is in use, attempting to find process..."
+        fuser -k 80/tcp 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Issue certificate with shortlived profile
+    print_info "Issuing IP certificate for ${ipv4}..."
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+    
+    ~/.acme.sh/acme.sh --issue \
+        ${domain_args} \
+        --standalone \
+        --server letsencrypt \
+        --valid-to "+6d" \
+        --httpport ${WebPort} \
+        --force
+
+    if [ $? -ne 0 ]; then
+        print_error "Failed to issue IP certificate"
+        print_warning "Please ensure port 80 is reachable from the internet"
+        rm -rf ~/.acme.sh/${ipv4} 2>/dev/null
+        [[ -n "$ipv6" ]] && rm -rf ~/.acme.sh/${ipv6} 2>/dev/null
+        rm -rf ${acmeCertDir} 2>/dev/null
+        return 1
+    fi
+
+    print_success "Certificate issued successfully, installing..."
+
+    # Install certificate
+    ~/.acme.sh/acme.sh --installcert -d ${ipv4} \
+        --key-file "${acmeCertDir}/privkey.pem" \
+        --fullchain-file "${acmeCertDir}/fullchain.pem" \
+        --reloadcmd "cp ${acmeCertDir}/privkey.pem ${cert_dir}/ && cp ${acmeCertDir}/fullchain.pem ${cert_dir}/ && cd ${INSTALL_DIR} && docker compose restart 3xui 2>/dev/null || true" 2>&1 || true
+
+    # Verify certificate files exist
+    if [[ ! -f "${acmeCertDir}/fullchain.pem" || ! -f "${acmeCertDir}/privkey.pem" ]]; then
+        print_error "Certificate files not found after installation"
+        rm -rf ~/.acme.sh/${ipv4} 2>/dev/null
+        [[ -n "$ipv6" ]] && rm -rf ~/.acme.sh/${ipv6} 2>/dev/null
+        rm -rf ${acmeCertDir} 2>/dev/null
+        return 1
+    fi
+    
+    # Copy to our cert directory
+    cp "${acmeCertDir}/fullchain.pem" "${cert_dir}/"
+    cp "${acmeCertDir}/privkey.pem" "${cert_dir}/"
+    chmod 600 "${cert_dir}/privkey.pem"
+    chmod 644 "${cert_dir}/fullchain.pem"
+    
+    print_success "Certificate files installed successfully"
+
+    # Enable auto-upgrade for acme.sh
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
+
+    print_success "IP certificate installed and configured successfully!"
+    print_info "Certificate valid for ~6 days, auto-renews via acme.sh cron job."
+    return 0
+}
+
+# Interactive SSL setup (domain or IP)
+prompt_and_setup_ssl() {
     local cert_dir="$1"
-    local ip="$2"
-    local days="${3:-30}"
-    
-    print_info "Setting up self-signed certificate auto-renewal every $days days..."
-    
-    # Create renewal script
-    cat > /etc/cron.monthly/3xui-self-signed-renewal << EOF
-#!/bin/bash
-# 3X-UI Self-Signed Certificate Auto-Renewal Script
+    local server_ip="$2"
 
-# Generate new certificate
-openssl genrsa -out "$cert_dir/privkey.pem" 2048
-openssl req -new -x509 \\
-    -key "$cert_dir/privkey.pem" \\
-    -out "$cert_dir/fullchain.pem" \\
-    -days $days \\
-    -subj "/CN=$ip" \\
-    -addext "subjectAltName=IP:$ip,DNS:$ip"
+    echo ""
+    echo -e "${CYAN}Choose SSL certificate setup method:${NC}"
+    echo -e "${GREEN}1.${NC} Let's Encrypt for Domain (90-day validity, auto-renews)"
+    echo -e "${GREEN}2.${NC} Let's Encrypt for IP Address (6-day validity, auto-renews)"
+    echo -e "${GREEN}3.${NC} Skip SSL setup (configure later)"
+    echo -e "${BLUE}Note:${NC} Both options require port 80 open for HTTP-01 challenge."
+    echo ""
+    read -rp "Choose an option [1-3, default: 2]: " ssl_choice
+    ssl_choice="${ssl_choice:-2}"
 
-chmod 600 "$cert_dir/privkey.pem"
-chmod 644 "$cert_dir/fullchain.pem"
-
-# Restart container
-cd $INSTALL_DIR && docker compose restart 3xui
-EOF
-    
-    chmod +x /etc/cron.monthly/3xui-self-signed-renewal
-    
-    print_success "Self-signed certificate auto-renewal configured!"
+    case "$ssl_choice" in
+    1)
+        # Let's Encrypt domain certificate
+        print_info "Using Let's Encrypt for domain certificate..."
+        
+        local domain=""
+        while true; do
+            read -rp "Please enter your domain name: " domain
+            domain="${domain// /}"
+            
+            if [[ -z "$domain" ]]; then
+                print_error "Domain name cannot be empty. Please try again."
+                continue
+            fi
+            
+            if ! is_domain "$domain"; then
+                print_error "Invalid domain format: ${domain}. Please enter a valid domain name."
+                continue
+            fi
+            
+            break
+        done
+        
+        setup_ssl_certificate "$domain" "$cert_dir"
+        if [ $? -eq 0 ]; then
+            SSL_HOST="${domain}"
+            CERT_TYPE="letsencrypt-domain"
+            print_success "SSL certificate configured successfully with domain: ${domain}"
+        else
+            print_warning "SSL setup failed. You can configure it later from the menu."
+            SSL_HOST="${server_ip}"
+            CERT_TYPE="none"
+        fi
+        ;;
+    2)
+        # Let's Encrypt IP certificate
+        print_info "Using Let's Encrypt for IP certificate (shortlived profile)..."
+        
+        # Ask for optional IPv6
+        local ipv6_addr=""
+        local detected_ipv6=$(get_server_ipv6)
+        if [[ -n "$detected_ipv6" ]]; then
+            echo -e "Detected IPv6: ${GREEN}$detected_ipv6${NC}"
+            read -rp "Include this IPv6 address? [Y/n]: " include_ipv6
+            if [[ "$include_ipv6" != "n" && "$include_ipv6" != "N" ]]; then
+                ipv6_addr="$detected_ipv6"
+            fi
+        else
+            read -rp "Enter IPv6 address to include (leave empty to skip): " ipv6_addr
+            ipv6_addr="${ipv6_addr// /}"
+        fi
+        
+        setup_ip_certificate "${server_ip}" "${ipv6_addr}" "$cert_dir"
+        if [ $? -eq 0 ]; then
+            SSL_HOST="${server_ip}"
+            CERT_TYPE="letsencrypt-ip"
+            print_success "Let's Encrypt IP certificate configured successfully"
+        else
+            print_warning "IP certificate setup failed. You can configure it later from the menu."
+            SSL_HOST="${server_ip}"
+            CERT_TYPE="none"
+        fi
+        ;;
+    3)
+        print_warning "Skipping SSL setup. Remember to configure SSL later!"
+        SSL_HOST="${server_ip}"
+        CERT_TYPE="none"
+        ;;
+    *)
+        print_warning "Invalid option. Skipping SSL setup."
+        SSL_HOST="${server_ip}"
+        CERT_TYPE="none"
+        ;;
+    esac
 }
 
 # Create docker-compose.yml with host network
@@ -285,7 +508,7 @@ services:
     container_name: 3xui_app
     network_mode: host
     volumes:
-      - \$PWD/cert/:/root/cert/
+      - \$PWD/cert/:/cert/
     environment:
       # Xray settings
       XRAY_VMESS_AEAD_FORCED: "false"
@@ -351,7 +574,7 @@ services:
       # - "443:443"
       # - "8443:8443"
     volumes:
-      - \$PWD/cert/:/root/cert/
+      - \$PWD/cert/:/cert/
     environment:
       # Xray settings
       XRAY_VMESS_AEAD_FORCED: "false"
@@ -503,11 +726,21 @@ show_status() {
         local server_ip=$(get_server_ip)
         echo ""
         echo -e "${WHITE}Access Panel:${NC}"
-        if [[ "$CERT_TYPE" == "letsencrypt" ]]; then
+        if [[ "$CERT_TYPE" == "letsencrypt-domain" ]]; then
             echo -e "  ${GREEN}https://$DOMAIN_OR_IP:$PANEL_PORT${NC}"
+        elif [[ "$CERT_TYPE" == "letsencrypt-ip" ]]; then
+            echo -e "  ${GREEN}https://$DOMAIN_OR_IP:$PANEL_PORT${NC}"
+            echo -e "  ${YELLOW}(IP certificate valid ~6 days, auto-renews)${NC}"
         else
             echo -e "  ${GREEN}http://$server_ip:$PANEL_PORT${NC}"
-            echo -e "  ${YELLOW}(Self-signed HTTPS also available)${NC}"
+            echo -e "  ${YELLOW}(No SSL configured)${NC}"
+        fi
+        
+        if [[ "$CERT_TYPE" != "none" ]]; then
+            echo ""
+            echo -e "${WHITE}SSL paths for panel settings:${NC}"
+            echo -e "  Certificate:  ${CYAN}/app/cert/fullchain.pem${NC}"
+            echo -e "  Private Key:  ${CYAN}/app/cert/privkey.pem${NC}"
         fi
     fi
 }
@@ -649,20 +882,107 @@ renew_certificate() {
     
     local cert_dir="$INSTALL_DIR/cert"
     
-    if [[ "$CERT_TYPE" == "letsencrypt" ]]; then
-        print_info "Renewing Let's Encrypt certificate..."
-        certbot renew --force-renewal
-        cp "/etc/letsencrypt/live/$DOMAIN_OR_IP/fullchain.pem" "$cert_dir/"
-        cp "/etc/letsencrypt/live/$DOMAIN_OR_IP/privkey.pem" "$cert_dir/"
-    else
-        print_info "Regenerating self-signed certificate..."
-        generate_self_signed_cert "$cert_dir" "$DOMAIN_OR_IP" 30
+    # Check if acme.sh is installed
+    if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
+        print_error "acme.sh is not installed. Cannot renew certificate."
+        return 1
     fi
     
-    cd "$INSTALL_DIR"
-    docker compose restart 3xui
+    print_info "Renewing certificate via acme.sh..."
     
-    print_success "Certificate renewed!"
+    if [[ "$CERT_TYPE" == "letsencrypt-domain" ]]; then
+        # Renew domain certificate
+        print_info "Renewing Let's Encrypt certificate for domain: $DOMAIN_OR_IP"
+        
+        # Stop containers to free port 80
+        cd "$INSTALL_DIR"
+        docker compose down 2>/dev/null || true
+        
+        ~/.acme.sh/acme.sh --renew -d "$DOMAIN_OR_IP" --force
+        
+        if [ $? -eq 0 ]; then
+            # Copy renewed certificates
+            local acmeCertPath="/root/cert/${DOMAIN_OR_IP}"
+            if [[ -f "${acmeCertPath}/fullchain.pem" && -f "${acmeCertPath}/privkey.pem" ]]; then
+                cp "${acmeCertPath}/fullchain.pem" "${cert_dir}/"
+                cp "${acmeCertPath}/privkey.pem" "${cert_dir}/"
+                chmod 600 "${cert_dir}/privkey.pem"
+                chmod 644 "${cert_dir}/fullchain.pem"
+                print_success "Domain certificate renewed successfully!"
+            fi
+        else
+            print_error "Failed to renew domain certificate"
+        fi
+        
+    elif [[ "$CERT_TYPE" == "letsencrypt-ip" ]]; then
+        # Renew IP certificate
+        print_info "Renewing Let's Encrypt certificate for IP: $DOMAIN_OR_IP"
+        
+        # Stop containers to free port 80
+        cd "$INSTALL_DIR"
+        docker compose down 2>/dev/null || true
+        
+        ~/.acme.sh/acme.sh --renew -d "$DOMAIN_OR_IP" --force
+        
+        if [ $? -eq 0 ]; then
+            # Copy renewed certificates
+            local acmeCertDir="/root/cert/ip"
+            if [[ -f "${acmeCertDir}/fullchain.pem" && -f "${acmeCertDir}/privkey.pem" ]]; then
+                cp "${acmeCertDir}/fullchain.pem" "${cert_dir}/"
+                cp "${acmeCertDir}/privkey.pem" "${cert_dir}/"
+                chmod 600 "${cert_dir}/privkey.pem"
+                chmod 644 "${cert_dir}/fullchain.pem"
+                print_success "IP certificate renewed successfully!"
+            fi
+        else
+            print_error "Failed to renew IP certificate"
+        fi
+        
+    else
+        print_warning "No valid certificate type found. Running new SSL setup..."
+        local server_ip=$(get_server_ip)
+        prompt_and_setup_ssl "$cert_dir" "$server_ip"
+        
+        # Update config with new cert type
+        save_config "$PANEL_PORT" "$SUB_PORT" "$DB_PASSWORD" "$NETWORK_MODE" "$CERT_TYPE" "$SSL_HOST"
+        DOMAIN_OR_IP="$SSL_HOST"
+    fi
+    
+    # Restart services
+    cd "$INSTALL_DIR"
+    docker compose up -d
+    
+    print_success "Certificate operation completed!"
+}
+
+# Setup new certificate (from menu)
+setup_new_certificate() {
+    if ! load_config; then
+        print_error "Configuration not found. Please run installation first."
+        return 1
+    fi
+    
+    local cert_dir="$INSTALL_DIR/cert"
+    local server_ip=$(get_server_ip)
+    
+    echo ""
+    echo -e "${YELLOW}Current certificate type: ${CERT_TYPE}${NC}"
+    echo -e "${YELLOW}Current domain/IP: ${DOMAIN_OR_IP}${NC}"
+    echo ""
+    
+    # Run interactive SSL setup
+    prompt_and_setup_ssl "$cert_dir" "$server_ip"
+    
+    # Update config with new cert type
+    save_config "$PANEL_PORT" "$SUB_PORT" "$DB_PASSWORD" "$NETWORK_MODE" "$CERT_TYPE" "$SSL_HOST"
+    
+    # Restart services
+    cd "$INSTALL_DIR"
+    docker compose up -d
+    
+    print_success "Certificate setup completed!"
+    echo -e "New certificate type: ${GREEN}$CERT_TYPE${NC}"
+    echo -e "Domain/IP: ${GREEN}$SSL_HOST${NC}"
 }
 
 # Uninstall
@@ -694,9 +1014,13 @@ uninstall() {
     cd "$INSTALL_DIR" 2>/dev/null || true
     docker compose down -v 2>/dev/null || true
     
-    # Remove cron jobs
-    rm -f /etc/cron.daily/3xui-cert-renewal 2>/dev/null || true
-    rm -f /etc/cron.monthly/3xui-self-signed-renewal 2>/dev/null || true
+    # Remove acme.sh certificates (optional - keep for other uses)
+    read -p "Remove acme.sh certificates? [y/N]: " remove_acme
+    if [[ "$remove_acme" == "y" || "$remove_acme" == "Y" ]]; then
+        rm -rf /root/cert 2>/dev/null || true
+        rm -rf ~/.acme.sh 2>/dev/null || true
+        print_info "acme.sh certificates removed"
+    fi
     
     # Remove installation directory
     rm -rf "$INSTALL_DIR"
@@ -793,45 +1117,25 @@ install_wizard() {
     echo ""
     echo -e "${PURPLE}[Step 5/6]${NC} SSL Certificate Configuration"
     local server_ip=$(get_server_ip)
-    echo -e "Your server IP: ${GREEN}$server_ip${NC}"
-    echo ""
-    echo -e "${CYAN}Certificate options:${NC}"
-    echo "1) Self-signed certificate for IP (30 days, auto-renewal)"
-    echo "2) Let's Encrypt certificate for domain (90 days, auto-renewal)"
-    echo "3) Skip certificate setup (configure later)"
-    echo ""
-    read -p "Select [1-3, default: 1]: " cert_choice
-    cert_choice=${cert_choice:-1}
+    echo -e "Your server IPv4: ${GREEN}$server_ip${NC}"
     
-    local cert_type="none"
-    local domain_or_ip="$server_ip"
+    local detected_ipv6=$(get_server_ipv6)
+    if [[ -n "$detected_ipv6" ]]; then
+        echo -e "Your server IPv6: ${GREEN}$detected_ipv6${NC}"
+    fi
     
     # Create installation directory
     mkdir -p "$INSTALL_DIR/cert"
     
-    case $cert_choice in
-        1)
-            cert_type="self-signed"
-            domain_or_ip="$server_ip"
-            generate_self_signed_cert "$INSTALL_DIR/cert" "$server_ip" 30
-            setup_self_signed_renewal "$INSTALL_DIR/cert" "$server_ip" 30
-            ;;
-        2)
-            cert_type="letsencrypt"
-            read -p "Enter your domain name: " domain_or_ip
-            if [[ -z "$domain_or_ip" ]]; then
-                print_error "Domain name is required!"
-                exit 1
-            fi
-            read -p "Enter email for Let's Encrypt [$domain_or_ip admin]: " cert_email
-            cert_email=${cert_email:-"admin@$domain_or_ip"}
-            install_letsencrypt_cert "$domain_or_ip" "$INSTALL_DIR/cert" "$cert_email"
-            ;;
-        3)
-            cert_type="none"
-            print_warning "Skipping certificate setup. Remember to configure SSL later!"
-            ;;
-    esac
+    # Initialize SSL variables
+    SSL_HOST="$server_ip"
+    CERT_TYPE="none"
+    
+    # Interactive SSL setup
+    prompt_and_setup_ssl "$INSTALL_DIR/cert" "$server_ip"
+    
+    local cert_type="$CERT_TYPE"
+    local domain_or_ip="$SSL_HOST"
     
     # Step 6: Create and start services
     echo ""
@@ -867,8 +1171,11 @@ install_wizard() {
     echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo -e "${WHITE}Access your panel:${NC}"
-    if [[ "$cert_type" == "letsencrypt" ]]; then
+    if [[ "$cert_type" == "letsencrypt-domain" ]]; then
         echo -e "  ${GREEN}https://$domain_or_ip:$panel_port${NC}"
+    elif [[ "$cert_type" == "letsencrypt-ip" ]]; then
+        echo -e "  ${GREEN}https://$server_ip:$panel_port${NC}"
+        echo -e "  ${YELLOW}(IP certificate valid ~6 days, auto-renews via acme.sh)${NC}"
     else
         echo -e "  ${GREEN}http://$server_ip:$panel_port${NC}"
     fi
@@ -879,6 +1186,12 @@ install_wizard() {
     echo ""
     echo -e "${YELLOW}⚠️  Please change default credentials after first login!${NC}"
     echo ""
+    if [[ "$cert_type" != "none" ]]; then
+        echo -e "${WHITE}SSL Certificate paths (for panel web settings):${NC}"
+        echo -e "  Certificate:  ${CYAN}/app/cert/fullchain.pem${NC}"
+        echo -e "  Private Key:  ${CYAN}/app/cert/privkey.pem${NC}"
+        echo ""
+    fi
     echo -e "${WHITE}Management commands:${NC}"
     echo -e "  ${CYAN}bash install.sh${NC} - Open management menu"
     echo ""
@@ -905,13 +1218,14 @@ main_menu() {
         echo -e "  ${YELLOW}9)${NC}  Change Subscription Port"
         echo -e "  ${YELLOW}10)${NC} Change Database Password"
         echo -e "  ${YELLOW}11)${NC} Renew Certificate"
+        echo -e "  ${YELLOW}12)${NC} Setup New Certificate"
         echo ""
-        echo -e "  ${RED}12)${NC} Uninstall"
+        echo -e "  ${RED}13)${NC} Uninstall"
         echo -e "  ${WHITE}0)${NC}  Exit"
         echo ""
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
-        read -p "Select option [0-12]: " choice
+        read -p "Select option [0-13]: " choice
         
         case $choice in
             1) install_wizard ;;
@@ -929,7 +1243,8 @@ main_menu() {
             9) change_sub_port ;;
             10) change_db_password ;;
             11) renew_certificate ;;
-            12) uninstall ;;
+            12) setup_new_certificate ;;
+            13) uninstall ;;
             0) 
                 echo -e "${GREEN}Goodbye!${NC}"
                 exit 0
