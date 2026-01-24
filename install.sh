@@ -348,7 +348,8 @@ escape_sql() {
 escape_yaml() {
     local str="$1"
     # If string contains special chars, quote it
-    if [[ "$str" =~ [:\#\'\"\[\]\{\}\|>\<\!\&\*\?\@\`] ]]; then
+    # Using grep to check for special characters
+    if echo "$str" | grep -q '[:#"'"'"'\[\]{}|><!\&\*\?@`]'; then
         # Escape double quotes and wrap in double quotes
         str="${str//\\/\\\\}"
         str="${str//\"/\\\"}"
